@@ -1,0 +1,207 @@
+import { readFile } from 'node:fs/promises'
+import { expect, test } from '@playwright/test'
+import type { Page } from '@playwright/test'
+
+async function fillMeasure(page: Page, label: string, value: string) {
+  const input = page.getByRole('textbox', { name: label, exact: true })
+  await input.fill(value)
+  await input.press('Enter')
+}
+
+async function start(page: Page) {
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: 'Ściana łazienkowa', exact: true })).toBeVisible()
+}
+
+async function saved(page: Page) {
+  await expect(page.getByTestId('save-state')).toContainText('Zapisano lokalnie')
+}
+
+test('edits the grid, moves the viewport separately and restores the project', async ({ page, context, browserName, isMobile }, info) => {
+  await start(page)
+  const stage = page.getByTestId('tile-viewport')
+  const initial = await stage.locator('.opening').evaluateAll(items => items.map(item => item.getAttribute('d')))
+  await page.getByRole('button', { name: 'Przesuń siatkę' }).click()
+  const box = await stage.boundingBox()
+  if (!box) throw new Error('Drawing has no visible bounds')
+  const x = Math.round(box.x + box.width / 2)
+  const y = Math.round(box.y + box.height / 2)
+  if (browserName === 'chromium' && isMobile) {
+    const session = await context.newCDPSession(page)
+    await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] })
+    await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: x + 42, y: y - 29 }] })
+    await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+  } else {
+    await page.mouse.move(x, y)
+    await page.mouse.down()
+    await page.mouse.move(x + 42, y - 29, { steps: 5 })
+    await page.mouse.up()
+  }
+  await expect(page.getByRole('textbox', { name: 'X od lewej', exact: true })).not.toHaveValue('48')
+  expect(await stage.locator('.opening').evaluateAll(items => items.map(item => item.getAttribute('d')))).toEqual(initial)
+  await page.getByRole('button', { name: 'cm', exact: true }).click()
+  await fillMeasure(page, 'X od lewej', '112,2')
+  await fillMeasure(page, 'Y od dołu', '13,8')
+  await fillMeasure(page, 'Fuga', '0')
+  await page.getByRole('button', { name: 'Pionowo' }).click()
+  await page.getByRole('button', { name: 'Powiększ', exact: true }).click()
+  await page.getByRole('button', { name: 'Przesuń widok' }).click()
+  const camera = await stage.getAttribute('viewBox')
+  await stage.scrollIntoViewIfNeeded()
+  const center = await stage.boundingBox()
+  if (!center) throw new Error('Drawing has no visible bounds')
+  await page.mouse.move(center.x + center.width / 2, center.y + center.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(center.x + center.width / 2 - 39, center.y + center.height / 2 + 20, { steps: 4 })
+  await page.mouse.up()
+  await expect(stage).not.toHaveAttribute('viewBox', camera ?? '')
+  await expect(page.getByRole('textbox', { name: 'X od lewej', exact: true })).toHaveValue('112,2')
+  await saved(page)
+  await page.reload()
+  await expect(page.getByRole('textbox', { name: 'X od lewej', exact: true })).toHaveValue('1122')
+  await expect(page.getByRole('textbox', { name: 'Y od dołu', exact: true })).toHaveValue('138')
+  await expect(page.getByRole('textbox', { name: 'Fuga', exact: true })).toHaveValue('0')
+  await expect(page.getByRole('button', { name: 'Pionowo' })).toHaveAttribute('aria-pressed', 'true')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+  await page.screenshot({ path: info.outputPath('planner.png') })
+})
+
+test('previews and saves an L split, then restores it after a geometry edit', async ({ page }) => {
+  await start(page)
+  const cuts = page.getByTestId('split-cut')
+  const originalCount = await cuts.count()
+  expect(originalCount).toBeGreaterThan(0)
+  await cuts.first().focus()
+  await cuts.first().press('Enter')
+  await page.getByRole('button', { name: /Podział poziomy/ }).click()
+  await expect(page.getByText('Fuga w podziale 3 mm')).toBeVisible()
+  await expect(cuts).toHaveCount(originalCount - 1)
+  await page.getByRole('button', { name: /Podział pionowy/ }).click()
+  await page.getByRole('button', { name: 'Zastosuj podział' }).click()
+  await saved(page)
+  await page.reload()
+  await expect(cuts).toHaveCount(originalCount - 1)
+  await fillMeasure(page, 'X od lewej', '55')
+  await expect(page.getByRole('button', { name: 'Cofnij zmianę' })).toBeVisible()
+  await page.getByRole('button', { name: 'Cofnij zmianę' }).click()
+  await expect(page.getByRole('textbox', { name: 'X od lewej', exact: true })).toHaveValue('48')
+  await expect(cuts).toHaveCount(originalCount - 1)
+})
+
+test('keeps projects, openings and a cropped texture independent and generates PDF', async ({ page }, info) => {
+  await start(page)
+  await page.getByRole('button', { name: 'Nowy projekt', exact: true }).click()
+  await page.getByRole('textbox', { name: 'Nazwa projektu' }).fill('Remont łącznie')
+  await page.getByRole('radio', { name: 'Przykład podłogi z rurą' }).check()
+  await page.getByRole('button', { name: 'Utwórz projekt' }).click()
+  await expect(page.getByRole('heading', { name: 'Remont łącznie' })).toBeVisible()
+  await page.getByRole('button', { name: 'Koło', exact: true }).click()
+  await fillMeasure(page, 'Średnica otworu', '44')
+  const label = page.getByRole('textbox', { name: 'Nazwa otworu', exact: true })
+  await label.fill('Zimna woda')
+  await label.press('Enter')
+  await expect(page.getByRole('button', { name: /Zimna woda.*44/ })).toBeVisible()
+  await page.getByRole('button', { name: 'Pionowo', exact: true }).click()
+  await page.getByLabel('Plik tekstury płytki').setInputFiles('src/assets/stone.jpg')
+  await expect(page.getByRole('dialog', { name: 'Wykadruj teksturę' })).toBeVisible()
+  await page.getByLabel('Rozmiar kadru').fill('70')
+  await page.getByRole('button', { name: 'Użyj tekstury' }).click()
+  await expect(page.getByRole('button', { name: 'Z teksturą' })).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.getByTestId('tile-viewport').locator('pattern image')).toHaveAttribute('href', /^blob:/)
+  await saved(page)
+  await page.reload()
+  await expect(page.getByTestId('tile-viewport').locator('pattern image')).toHaveAttribute('href', /^blob:/)
+  await page.getByRole('button', { name: 'Dodaj powierzchnię' }).click()
+  await page.getByRole('dialog').getByRole('button', { name: 'Ściana', exact: true }).click()
+  await saved(page)
+
+  for (const withTexture of [false, true]) {
+    await page.getByRole('button', { name: 'Pobierz PDF' }).click()
+    const dialog = page.getByRole('dialog', { name: 'Pobierz plan PDF' })
+    await dialog.getByLabel('Dodaj tekstury płytek').setChecked(withTexture)
+    const [download] = await Promise.all([
+      page.waitForEvent('download'), dialog.getByRole('button', { name: 'Pobierz PDF' }).click(),
+    ])
+    const pdf = info.outputPath(withTexture ? 'texture.pdf' : 'technical.pdf')
+    await download.saveAs(pdf)
+    expect(download.suggestedFilename().normalize()).toBe('Remont łącznie.pdf')
+    const content = await readFile(pdf)
+    expect(content.toString('latin1', 0, 5)).toBe('%PDF-')
+    expect((content.toString('latin1').match(/\/Type \/Page\b/g) ?? []).length).toBeGreaterThanOrEqual(2)
+    expect(content.toString('latin1').includes('/Subtype /Image')).toBe(withTexture)
+  }
+  await page.getByRole('button', { name: 'Projekty', exact: true }).click()
+  await page.getByRole('button', { name: 'Zmień nazwę projektu Remont łącznie' }).click()
+  await page.getByRole('textbox', { name: 'Nazwa projektu' }).fill('Kuchnia')
+  await page.getByRole('button', { name: 'Zapisz', exact: true }).click()
+  await expect(page.getByRole('button', { name: /Kuchnia.*Otwarty projekt/ })).toBeVisible()
+  await page.getByRole('button', { name: /Ściana łazienkowa.*powierzchnia/ }).click()
+  await expect(page.getByRole('heading', { name: 'Ściana łazienkowa', exact: true })).toBeVisible()
+  await expect(page.getByTestId('tile-viewport').locator('pattern image')).not.toHaveAttribute('href', /^blob:/)
+  await page.getByRole('button', { name: 'Projekty', exact: true }).click()
+  await page.getByRole('button', { name: 'Usuń projekt Kuchnia' }).click()
+  await expect(page.getByText('Usunąć projekt „Kuchnia” z tej przeglądarki?')).toBeVisible()
+  await page.getByRole('button', { name: 'Usuń projekt', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Usuń projekt Kuchnia' })).toHaveCount(0)
+})
+
+test('reports an edit conflict between two tabs and protects the newer project', async ({ page, context }) => {
+  await start(page)
+  const other = await context.newPage()
+  await start(other)
+  await fillMeasure(page, 'X od lewej', '73')
+  await saved(page)
+  await fillMeasure(other, 'X od lewej', '95')
+  await expect(other.getByRole('alert')).toContainText('innej karcie')
+  await expect(other.getByRole('textbox', { name: 'X od lewej', exact: true })).toHaveValue('95')
+  await page.reload()
+  await expect(page.getByRole('textbox', { name: 'X od lewej', exact: true })).toHaveValue('73')
+})
+
+test('moves and resizes a rectangular opening with its drawing handles', async ({ page }) => {
+  await start(page)
+  await page.getByRole('button', { name: 'Prostokąt', exact: true }).click()
+  await fillMeasure(page, 'Szerokość otworu', '420')
+  await fillMeasure(page, 'Wysokość otworu', '310')
+  const drawing = page.getByTestId('tile-viewport')
+  await drawing.scrollIntoViewIfNeeded()
+
+  async function drag(locator: ReturnType<Page['locator']>, dx: number, dy: number) {
+    const box = await locator.boundingBox()
+    if (!box) throw new Error('Opening has no visible bounds')
+    const x = box.x + box.width / 2
+    const y = box.y + box.height / 2
+    await page.mouse.move(x, y)
+    await page.mouse.down()
+    await page.mouse.move(x + dx, y + dy, { steps: 5 })
+    await page.mouse.up()
+  }
+
+  const x = page.getByRole('textbox', { name: 'X otworu od lewej', exact: true })
+  const y = page.getByRole('textbox', { name: 'Y otworu od dołu', exact: true })
+  const beforeX = await x.inputValue()
+  const beforeY = await y.inputValue()
+  await drag(drawing.locator('.opening.selected'), 22, -24)
+  await expect(x).not.toHaveValue(beforeX)
+  await expect(y).not.toHaveValue(beforeY)
+  await drag(drawing.locator('.resize-handle'), 17, -15)
+  await expect(page.getByRole('textbox', { name: 'Szerokość otworu', exact: true })).not.toHaveValue('420')
+  await expect(page.getByRole('textbox', { name: 'Wysokość otworu', exact: true })).not.toHaveValue('310')
+  await page.getByRole('button', { name: 'Usuń otwór' }).click()
+  await expect(drawing.locator('.opening')).toHaveCount(3)
+})
+
+test('exports a crowded chart with additional A4 cut-list pages', async ({ page }, info) => {
+  await start(page)
+  await fillMeasure(page, 'Szerokość płytki', '180')
+  await fillMeasure(page, 'Wysokość płytki', '120')
+  await page.getByRole('button', { name: 'Pobierz PDF' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Pobierz plan PDF' })
+  const [download] = await Promise.all([
+    page.waitForEvent('download', { timeout: 10000 }), dialog.getByRole('button', { name: 'Pobierz PDF' }).click(),
+  ])
+  const file = info.outputPath('dense.pdf')
+  await download.saveAs(file)
+  const content = (await readFile(file)).toString('latin1')
+  expect((content.match(/\/Type \/Page\b/g) ?? []).length).toBeGreaterThan(1)
+})
